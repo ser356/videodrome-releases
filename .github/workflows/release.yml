@@ -1,0 +1,473 @@
+name: Release
+
+# Build + release de Videodrome disparado por el repo privado.
+#
+# Este workflow vive en el repo PÚBLICO (`ser356/videodrome-releases`) —
+# aquí los minutos de Actions son gratis ilimitados. El código fuente
+# vive en el repo privado (`ser356/videodrome`) y se checkoutea con un
+# fine-grained PAT (`SOURCE_REPO_PAT`) que solo tiene `contents:read`.
+#
+# Triggers:
+#   - `repository_dispatch` con event_type = `release-tag`:
+#         el repo privado hace `gh api ... /dispatches` al pushear un
+#         tag `v*` (workflow `dispatch-release.yml`). El tag viaja en
+#         `client_payload.tag`.
+#   - `workflow_dispatch` con input `tag`:
+#         disparo manual desde la pestaña Actions o
+#         `gh workflow run release.yml --repo ser356/videodrome-releases -f tag=v1.16.0`.
+#
+# Produce dos tipos de artefactos:
+#   - GUI bundle:  Videodrome.app (mac, arm64) y Videodrome.exe (win, x64).
+#                  El mismo binario acepta subcomandos por terminal → CLI.
+#   - Linux:       tarball CLI (sin gui) + .AppImage/.deb con gui.
+#
+# Publica el cask (mac) en `ser356/homebrew-cask` y el manifest scoop
+# (win) en `ser356/scoop-bucket` renderizando los templates que viven
+# en el repo privado (los sacamos vía el mismo checkout PAT).
+on:
+  repository_dispatch:
+    types: [release-tag]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag/versión a publicar (ej. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Repo privado del código fuente. Todos los jobs hacen checkout de
+  # aquí con el PAT `SOURCE_REPO_PAT`. Centralizado en un solo sitio.
+  SOURCE_REPO: ser356/videodrome
+
+jobs:
+  # ─── Prepare: resuelve el tag una única vez ─────────────────────────
+  # Los otros jobs referencian `needs.prepare.outputs.tag` en lugar de
+  # `github.ref_name` (que aquí sería `main`, el default branch del repo
+  # público — nada útil) o `github.event.inputs.tag` (solo definido si
+  # el disparo fue `workflow_dispatch`).
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.event.client_payload.tag }}"
+          if [ -z "$TAG" ]; then
+            echo "❌ No hay tag en inputs ni en client_payload"
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Tag '$TAG' no cumple v<semver>"
+            exit 1
+          fi
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"  >> "$GITHUB_OUTPUT"
+          echo "→ tag=$TAG"
+
+  # ─── Linux: solo binario CLI (sin GUI) ─────────────────────────────
+  build-linux-cli:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cli
+      - name: cargo build --release (sin gui)
+        env:
+          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
+          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
+          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
+          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Empaquetar
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/videodrome dist/videodrome
+          cp README.md dist/ 2>/dev/null || true
+          cp LICENSE dist/ 2>/dev/null || true
+          cd dist
+          tar czf ../videodrome-${{ needs.prepare.outputs.tag }}-linux-x86_64.tar.gz *
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videodrome-linux-x86_64
+          path: videodrome-*-linux-x86_64.tar.gz
+          retention-days: 7
+
+  # ─── Linux GUI: .AppImage + .deb (Tauri) ───────────────────────────
+  build-linux-gui:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-gui-${{ matrix.arch }}
+
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf \
+            file \
+            libfuse2 \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Instalar tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Build frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Tauri build (deb + appimage)
+        env:
+          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
+          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
+          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
+          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
+        run: |
+          cargo tauri build \
+            --target ${{ matrix.target }} \
+            --bundles deb,appimage \
+            --features gui
+
+      - name: Renombrar artefactos
+        id: rename
+        run: |
+          set -euo pipefail
+          BASE="target/${{ matrix.target }}/release/bundle"
+          DEB=$(find "$BASE/deb" -maxdepth 2 -name "*.deb" | head -n1)
+          APP=$(find "$BASE/appimage" -maxdepth 2 -name "*.AppImage" | head -n1)
+          if [ -z "$DEB" ] || [ -z "$APP" ]; then
+            echo "❌ No encontré .deb o .AppImage en $BASE"
+            find "$BASE" -type f
+            exit 1
+          fi
+          TAG="${{ needs.prepare.outputs.tag }}"
+          NEW_DEB="videodrome-${TAG}-linux-${{ matrix.arch }}.deb"
+          NEW_APP="videodrome-${TAG}-linux-${{ matrix.arch }}.AppImage"
+          cp "$DEB" "$NEW_DEB"
+          cp "$APP" "$NEW_APP"
+          chmod +x "$NEW_APP"
+          echo "deb=$NEW_DEB" >> "$GITHUB_OUTPUT"
+          echo "app=$NEW_APP" >> "$GITHUB_OUTPUT"
+          ls -la "$NEW_DEB" "$NEW_APP"
+
+      - name: SHA256 del AppImage
+        run: |
+          SHA=$(sha256sum "${{ steps.rename.outputs.app }}" | awk '{print $1}')
+          echo "SHA256 (${{ matrix.arch }}): $SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videodrome-linux-${{ matrix.arch }}-gui
+          path: |
+            videodrome-*-linux-${{ matrix.arch }}.deb
+            videodrome-*-linux-${{ matrix.arch }}.AppImage
+          retention-days: 7
+
+  # ─── macOS: Videodrome.app zippeado (GUI + CLI dual) ───────────────
+  build-macos-gui:
+    needs: prepare
+    runs-on: macos-latest
+    outputs:
+      sha256: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-gui
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Instalar tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Build frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Tauri build (app bundle)
+        env:
+          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
+          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
+          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
+          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
+        run: |
+          cargo tauri build \
+            --target aarch64-apple-darwin \
+            --bundles app \
+            --features gui
+
+      - name: Empaquetar .app en zip (ditto preserva metadatos)
+        run: |
+          APP_PATH="target/aarch64-apple-darwin/release/bundle/macos/Videodrome.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ .app no encontrado en $APP_PATH"
+            find target -name "*.app" -type d
+            exit 1
+          fi
+          ZIP="videodrome-${{ needs.prepare.outputs.tag }}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP"
+          echo "✅ Generado $ZIP ($(du -h "$ZIP" | cut -f1))"
+
+      - name: SHA256 del zip macOS
+        id: sha
+        run: |
+          ZIP="videodrome-${{ needs.prepare.outputs.tag }}-macos-arm64.zip"
+          SHA=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videodrome-macos-arm64
+          path: videodrome-*-macos-arm64.zip
+          retention-days: 7
+
+  # ─── Windows: .exe zippeado (GUI + CLI dual) ───────────────────────
+  build-windows-gui:
+    needs: prepare
+    runs-on: windows-latest
+    outputs:
+      sha256: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gui
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Instalar tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Build frontend
+        working-directory: ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      - name: Tauri build (nsis)
+        env:
+          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
+          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
+          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
+          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis --features gui
+
+      - name: Empaquetar .exe en zip (para scoop)
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/videodrome.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error ".exe no encontrado en $exe"
+            Get-ChildItem target -Recurse -Filter *.exe
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item $exe pkg/videodrome.exe
+          Compress-Archive -Path pkg/videodrome.exe -DestinationPath "videodrome-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip"
+
+      - name: SHA256 del zip Windows
+        id: sha
+        shell: pwsh
+        run: |
+          $zip = "videodrome-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip"
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "SHA256: $sha"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videodrome-windows-x86_64
+          path: videodrome-*-windows-x86_64.zip
+          retention-days: 7
+
+  # ─── Publicar Release + subir todos los artifacts ──────────────────
+  release:
+    needs: [prepare, build-linux-cli, build-linux-gui, build-macos-gui, build-windows-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publicar Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: "Videodrome ${{ needs.prepare.outputs.tag }}"
+          files: dist/*
+          generate_release_notes: false
+          body: |
+            Build automático desde `ser356/videodrome` @ ${{ needs.prepare.outputs.tag }}.
+
+            **Assets**:
+            - macOS (arm64): `videodrome-${{ needs.prepare.outputs.tag }}-macos-arm64.zip`
+            - Windows (x86_64): `videodrome-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip`
+            - Linux CLI (x86_64): `videodrome-${{ needs.prepare.outputs.tag }}-linux-x86_64.tar.gz`
+            - Linux GUI (x86_64): `.deb` + `.AppImage`
+            - Linux GUI (aarch64): `.deb` + `.AppImage`
+
+  # ─── Cask (mac) + scoop (win) ──────────────────────────────────────
+  # Consume los SHA256 calculados en los jobs de build. Los templates
+  # de cask/scoop viven en el repo privado — se recuperan aquí con el
+  # mismo PAT que usa `build-*`.
+  publish-packages:
+    needs: [prepare, release, build-macos-gui, build-windows-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo (templates)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          sparse-checkout: |
+            packaging
+
+      - name: Verificar SHAs recibidos
+        run: |
+          echo "SHA macOS:   ${{ needs.build-macos-gui.outputs.sha256 }}"
+          echo "SHA Windows: ${{ needs.build-windows-gui.outputs.sha256 }}"
+          test -n "${{ needs.build-macos-gui.outputs.sha256 }}"   || { echo "❌ SHA macOS vacío";   exit 1; }
+          test -n "${{ needs.build-windows-gui.outputs.sha256 }}" || { echo "❌ SHA Windows vacío"; exit 1; }
+
+      # ── HOMEBREW CASK (mac) ──
+      # {{REPO}} = github.repository = ser356/videodrome-releases → las
+      # URLs del asset apuntan al repo público que aloja los ZIPs.
+      - name: Render cask
+        run: |
+          mkdir -p out
+          sed \
+            -e "s|{{VERSION}}|${{ needs.prepare.outputs.version }}|g" \
+            -e "s|{{TAG}}|${{ needs.prepare.outputs.tag }}|g" \
+            -e "s|{{SHA_MAC}}|${{ needs.build-macos-gui.outputs.sha256 }}|g" \
+            -e "s|{{REPO}}|${{ github.repository }}|g" \
+            packaging/homebrew-cask/videodrome.rb.tmpl > out/videodrome.rb
+          cat out/videodrome.rb
+
+      - name: Push a ser356/homebrew-cask
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_PAT }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/ser356/homebrew-cask.git" cask
+          mkdir -p cask/Casks
+          cp out/videodrome.rb cask/Casks/videodrome.rb
+          cd cask
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/videodrome.rb
+          if git diff --cached --quiet; then
+            echo "No hay cambios en el cask."
+          else
+            git commit -m "videodrome ${{ needs.prepare.outputs.tag }}"
+            git push
+          fi
+
+      # ── SCOOP BUCKET (win) ──
+      - name: Render scoop manifest
+        run: |
+          sed \
+            -e "s|{{VERSION}}|${{ needs.prepare.outputs.version }}|g" \
+            -e "s|{{TAG}}|${{ needs.prepare.outputs.tag }}|g" \
+            -e "s|{{SHA_WIN}}|${{ needs.build-windows-gui.outputs.sha256 }}|g" \
+            -e "s|{{REPO}}|${{ github.repository }}|g" \
+            packaging/scoop/videodrome.json.tmpl > out/videodrome.json
+          cat out/videodrome.json
+
+      - name: Push a ser356/scoop-bucket
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_PAT }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/ser356/scoop-bucket.git" bucket
+          mkdir -p bucket/bucket
+          cp out/videodrome.json bucket/bucket/videodrome.json
+          cd bucket
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/videodrome.json
+          if git diff --cached --quiet; then
+            echo "No hay cambios en el manifest."
+          else
+            git commit -m "videodrome ${{ needs.prepare.outputs.tag }}"
+            git push
+          fi
