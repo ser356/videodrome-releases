@@ -87,11 +87,6 @@ jobs:
         with:
           key: linux-cli
       - name: cargo build --release (sin gui)
-        env:
-          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
-          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
-          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
-          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
         run: cargo build --release --target x86_64-unknown-linux-gnu
       - name: Empaquetar
         run: |
@@ -170,11 +165,6 @@ jobs:
           npm run build
 
       - name: Tauri build (deb + appimage)
-        env:
-          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
-          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
-          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
-          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
         run: |
           cargo tauri build \
             --target ${{ matrix.target }} \
@@ -252,11 +242,6 @@ jobs:
           npm run build
 
       - name: Tauri build (app bundle)
-        env:
-          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
-          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
-          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
-          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
         run: |
           cargo tauri build \
             --target aarch64-apple-darwin \
@@ -326,11 +311,6 @@ jobs:
           npm run build
 
       - name: Tauri build (nsis)
-        env:
-          LB_APP_CLIENT_ID: ${{ secrets.LB_APP_CLIENT_ID }}
-          LB_APP_CLIENT_SECRET: ${{ secrets.LB_APP_CLIENT_SECRET }}
-          LB_APP_TMDB_BEARER: ${{ secrets.LB_APP_TMDB_BEARER }}
-          LB_APP_OS_API_KEY: ${{ secrets.LB_APP_OS_API_KEY }}
         run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis --features gui
 
       - name: Empaquetar .exe en zip (para scoop)
