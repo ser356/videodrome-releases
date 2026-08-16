@@ -32,6 +32,12 @@ on:
       tag:
         description: "Tag/versión a publicar (ej. v0.2.0)"
         required: true
+      skip_macos:
+        description: "Saltar build macOS (útil cuando publish.sh ya publicó el .app + cask)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 permissions:
   contents: write
@@ -53,11 +59,13 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      skip_macos: ${{ steps.tag.outputs.skip_macos }}
     steps:
       - id: tag
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.tag || github.event.client_payload.tag }}"
+          SKIP_MACOS_RAW="${{ github.event.inputs.skip_macos || github.event.client_payload.skip_macos }}"
           if [ -z "$TAG" ]; then
             echo "❌ No hay tag en inputs ni en client_payload"
             exit 1
@@ -66,9 +74,18 @@ jobs:
             echo "❌ Tag '$TAG' no cumple v<semver>"
             exit 1
           fi
-          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}"  >> "$GITHUB_OUTPUT"
-          echo "→ tag=$TAG"
+          # Normalizamos: cualquier cosa que no sea literalmente 'true'
+          # cuenta como false. Evita que "True" o "1" pasen por
+          # descuido y skipeen macos.
+          if [ "$SKIP_MACOS_RAW" = "true" ]; then
+            SKIP_MACOS="true"
+          else
+            SKIP_MACOS="false"
+          fi
+          echo "tag=$TAG"                >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"        >> "$GITHUB_OUTPUT"
+          echo "skip_macos=$SKIP_MACOS"  >> "$GITHUB_OUTPUT"
+          echo "→ tag=$TAG  skip_macos=$SKIP_MACOS"
 
   # ─── Linux: solo binario CLI (sin GUI) ─────────────────────────────
   build-linux-cli:
@@ -209,6 +226,13 @@ jobs:
   # ─── macOS: Videodrome.app zippeado (GUI + CLI dual) ───────────────
   build-macos-gui:
     needs: prepare
+    # Se salta si `publish.sh` ya publicó el .app localmente (dispatch
+    # con `skip_macos=true`). En ese escenario el release ya tiene el
+    # ZIP mac, y el cask ya está actualizado en homebrew-cask — cualquier
+    # rebuild aquí produciría un SHA256 nuevo (compilado en otra máquina)
+    # que rompe el `brew reinstall` de los usuarios que ya cachearon el
+    # asset original.
+    if: ${{ needs.prepare.outputs.skip_macos != 'true' }}
     runs-on: macos-latest
     outputs:
       sha256: ${{ steps.sha.outputs.sha }}
@@ -344,6 +368,17 @@ jobs:
   # ─── Publicar Release + subir todos los artifacts ──────────────────
   release:
     needs: [prepare, build-linux-cli, build-linux-gui, build-macos-gui, build-windows-gui]
+    # `build-macos-gui` puede estar skipped cuando `publish.sh` ya
+    # publicó el mac ZIP. En ese caso, seguimos con Linux+Windows.
+    # Requerimos éxito explícito del resto (si alguno falla, no
+    # subimos release incompleta).
+    if: |
+      always()
+      && needs.prepare.result == 'success'
+      && needs.build-linux-cli.result == 'success'
+      && needs.build-linux-gui.result == 'success'
+      && needs.build-windows-gui.result == 'success'
+      && (needs.build-macos-gui.result == 'success' || needs.build-macos-gui.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -351,11 +386,17 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Publicar Release
+        # softprops/action-gh-release@v2 hace upsert sobre el tag: si
+        # `publish.sh` ya creó la release con el ZIP mac, este step
+        # solo AÑADE los artefactos que faltan (Linux/Windows) sin
+        # tocar el mac ZIP existente. `fail_on_unmatched_files=true`
+        # para gritar si por alguna razón `dist/` viene vacío.
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: "Videodrome ${{ needs.prepare.outputs.tag }}"
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: false
           body: |
             Build automático desde `ser356/videodrome` @ ${{ needs.prepare.outputs.tag }}.
@@ -367,12 +408,16 @@ jobs:
             - Linux GUI (x86_64): `.deb` + `.AppImage`
             - Linux GUI (aarch64): `.deb` + `.AppImage`
 
-  # ─── Cask (mac) + scoop (win) ──────────────────────────────────────
-  # Consume los SHA256 calculados en los jobs de build. Los templates
-  # de cask/scoop viven en el repo privado — se recuperan aquí con el
-  # mismo PAT que usa `build-*`.
-  publish-packages:
-    needs: [prepare, release, build-macos-gui, build-windows-gui]
+  # ─── Cask (mac) ────────────────────────────────────────────────────
+  # Solo corre si CI construyó macOS. Cuando `publish.sh` publica desde
+  # el Mac de dev, envía `skip_macos=true` porque el script ya ha
+  # actualizado `ser356/homebrew-cask` con el SHA256 real del ZIP que
+  # subió — este job sería un no-op en el mejor caso, un race
+  # condition sobreescribiendo el cask con un SHA de otra máquina en
+  # el peor.
+  publish-cask:
+    needs: [prepare, release, build-macos-gui]
+    if: ${{ needs.prepare.outputs.skip_macos != 'true' && needs.build-macos-gui.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source repo (templates)
@@ -384,14 +429,11 @@ jobs:
           sparse-checkout: |
             packaging
 
-      - name: Verificar SHAs recibidos
+      - name: Verificar SHA mac
         run: |
-          echo "SHA macOS:   ${{ needs.build-macos-gui.outputs.sha256 }}"
-          echo "SHA Windows: ${{ needs.build-windows-gui.outputs.sha256 }}"
-          test -n "${{ needs.build-macos-gui.outputs.sha256 }}"   || { echo "❌ SHA macOS vacío";   exit 1; }
-          test -n "${{ needs.build-windows-gui.outputs.sha256 }}" || { echo "❌ SHA Windows vacío"; exit 1; }
+          echo "SHA macOS: ${{ needs.build-macos-gui.outputs.sha256 }}"
+          test -n "${{ needs.build-macos-gui.outputs.sha256 }}" || { echo "❌ SHA macOS vacío"; exit 1; }
 
-      # ── HOMEBREW CASK (mac) ──
       # {{REPO}} = github.repository = ser356/videodrome-releases → las
       # URLs del asset apuntan al repo público que aloja los ZIPs.
       - name: Render cask
@@ -423,9 +465,31 @@ jobs:
             git push
           fi
 
-      # ── SCOOP BUCKET (win) ──
+  # ─── Scoop bucket (win) ────────────────────────────────────────────
+  # Siempre corre — Windows nunca se saltea desde publish.sh (que solo
+  # cubre macOS).
+  publish-scoop:
+    needs: [prepare, release, build-windows-gui]
+    if: ${{ needs.build-windows-gui.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo (templates)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          sparse-checkout: |
+            packaging
+
+      - name: Verificar SHA win
+        run: |
+          echo "SHA Windows: ${{ needs.build-windows-gui.outputs.sha256 }}"
+          test -n "${{ needs.build-windows-gui.outputs.sha256 }}" || { echo "❌ SHA Windows vacío"; exit 1; }
+
       - name: Render scoop manifest
         run: |
+          mkdir -p out
           sed \
             -e "s|{{VERSION}}|${{ needs.prepare.outputs.version }}|g" \
             -e "s|{{TAG}}|${{ needs.prepare.outputs.tag }}|g" \
