@@ -418,7 +418,11 @@ jobs:
   # el peor.
   publish-cask:
     needs: [prepare, release, build-macos-gui]
-    if: ${{ needs.prepare.outputs.skip_macos != 'true' && needs.build-macos-gui.result == 'success' }}
+    # `always()` es imprescindible: `release` tiene su propio `if:`
+    # y en GHA, cuando un `needs` upstream es "conditional", los
+    # jobs downstream se saltan por defecto SIN evaluar su `if:`
+    # salvo que empiecen con `always()`.
+    if: ${{ always() && needs.release.result == 'success' && needs.prepare.outputs.skip_macos != 'true' && needs.build-macos-gui.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source repo (templates)
@@ -471,7 +475,7 @@ jobs:
   # cubre macOS).
   publish-scoop:
     needs: [prepare, release, build-windows-gui]
-    if: ${{ needs.build-windows-gui.result == 'success' }}
+    if: ${{ always() && needs.release.result == 'success' && needs.build-windows-gui.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source repo (templates)
