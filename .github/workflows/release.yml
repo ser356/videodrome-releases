@@ -146,7 +146,18 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-gui-${{ matrix.arch }}
+          key: linux-gui-${{ matrix.arch }}-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+
+      - name: Cachear Tetsuo
+        if: matrix.arch == 'aarch64'
+        uses: actions/cache@v4
+        with:
+          path: .tetsuo
+          key: tetsuo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+
+      - name: Provisionar Tetsuo
+        if: matrix.arch == 'aarch64'
+        run: bash scripts/bootstrap-tetsuo.sh
 
       - name: Instalar dependencias del sistema
         run: |
@@ -234,7 +245,7 @@ jobs:
     # que rompe el `brew reinstall` de los usuarios que ya cachearon el
     # asset original.
     if: ${{ needs.prepare.outputs.skip_macos != 'true' }}
-    runs-on: macos-latest
+    runs-on: macos-14
     outputs:
       sha256: ${{ steps.sha.outputs.sha }}
     steps:
@@ -248,7 +259,14 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-gui
+          key: macos-gui-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+      - name: Cachear Tetsuo
+        uses: actions/cache@v4
+        with:
+          path: .tetsuo
+          key: tetsuo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+      - name: Provisionar Tetsuo
+        run: bash scripts/bootstrap-tetsuo.sh
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -316,7 +334,17 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-gui
+          key: windows-gui-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+      - name: Cachear Tetsuo
+        uses: actions/cache@v4
+        with:
+          path: .tetsuo
+          key: tetsuo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/TETSUO_REV', 'native/TETSUO_SHA256') }}
+      - name: Provisionar Tetsuo
+        shell: bash
+        run: |
+          command -v clang
+          bash scripts/bootstrap-tetsuo.sh
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
