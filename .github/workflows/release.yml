@@ -317,7 +317,7 @@ jobs:
           path: videodrome-*-macos-arm64.zip
           retention-days: 7
 
-  # ─── Windows: .exe zippeado (GUI + CLI dual) ───────────────────────
+  # ─── Windows: .exe + libmpv zippeados (GUI + CLI dual) ─────────────
   build-windows-gui:
     needs: prepare
     runs-on: windows-latest
@@ -345,6 +345,30 @@ jobs:
         run: |
           command -v clang
           bash scripts/bootstrap-tetsuo.sh
+
+      - name: Preparar libmpv para Windows
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/prepare-windows-libmpv.ps1
+
+      - name: Verificar libmpv
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = (Resolve-Path 'native/windows/libmpv-2.dll').Path
+          $handle = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+          try {
+            foreach ($symbol in @('mpv_create', 'mpv_initialize', 'mpv_terminate_destroy', 'mpv_set_option_string', 'mpv_command', 'mpv_set_property', 'mpv_get_property', 'mpv_wait_event')) {
+              $ptr = [IntPtr]::Zero
+              if (-not [System.Runtime.InteropServices.NativeLibrary]::TryGetExport($handle, $symbol, [ref]$ptr)) {
+                throw "Missing libmpv export: $symbol"
+              }
+            }
+          } finally {
+            [System.Runtime.InteropServices.NativeLibrary]::Free($handle)
+          }
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -366,18 +390,31 @@ jobs:
       - name: Tauri build (nsis)
         run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis --features gui
 
-      - name: Empaquetar .exe en zip (para scoop)
+      - name: Empaquetar .exe + libmpv en zip (para scoop)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $exe = "target/x86_64-pc-windows-msvc/release/videodrome.exe"
           if (-not (Test-Path $exe)) {
             Write-Error ".exe no encontrado en $exe"
             Get-ChildItem target -Recurse -Filter *.exe
             exit 1
           }
+
+          Remove-Item -Recurse -Force pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path pkg | Out-Null
-          Copy-Item $exe pkg/videodrome.exe
-          Compress-Archive -Path pkg/videodrome.exe -DestinationPath "videodrome-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip"
+          Copy-Item $exe pkg/videodrome.exe -Force
+
+          $dlls = Get-ChildItem 'native/windows' -Filter '*.dll' -File
+          if (-not $dlls) { throw 'No hay DLLs de libmpv en native/windows.' }
+          $dlls | Copy-Item -Destination pkg -Force
+          if (-not (Test-Path 'pkg/libmpv-2.dll')) {
+            throw 'El paquete Windows no contiene libmpv-2.dll.'
+          }
+
+          Write-Host 'Contenido del paquete Windows:'
+          Get-ChildItem pkg | Select-Object Name, Length
+          Compress-Archive -Path pkg/* -DestinationPath "videodrome-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip"
 
       - name: SHA256 del zip Windows
         id: sha
